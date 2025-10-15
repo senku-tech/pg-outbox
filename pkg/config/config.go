@@ -24,7 +24,6 @@ type DispatcherConfig struct {
 	MaxAttempts       int           `yaml:"max_attempts"`        // Maximum retry attempts before giving up
 	PollInterval      time.Duration `yaml:"poll_interval"`       // How often to poll for new events (POLLING_MODE)
 	FallbackInterval  time.Duration `yaml:"fallback_interval"`   // How often to fallback to polling (LISTEN_MODE)
-	Workers           int           `yaml:"workers"`             // Number of concurrent batch processors
 	ShutdownGrace     time.Duration `yaml:"shutdown_grace"`      // Grace period for shutdown
 }
 
@@ -74,7 +73,6 @@ func LoadConfig(path string) (*Config, error) {
 			MaxAttempts:      3,
 			PollInterval:     1 * time.Second,
 			FallbackInterval: 30 * time.Second,
-			Workers:          5,
 			ShutdownGrace:    30 * time.Second,
 		},
 		Database: DatabaseConfig{
@@ -148,9 +146,6 @@ func (c *Config) validate() error {
 	}
 	if c.Dispatcher.BatchSize <= 0 {
 		return fmt.Errorf("batch size must be positive")
-	}
-	if c.Dispatcher.Workers <= 0 {
-		return fmt.Errorf("workers must be positive")
 	}
 	if c.Dispatcher.MaxAttempts <= 0 {
 		return fmt.Errorf("max attempts must be positive")

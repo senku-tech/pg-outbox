@@ -175,7 +175,6 @@ func (hs *HealthServer) handleStatus(w http.ResponseWriter, r *http.Request) {
 			Error: errorString(readyErr),
 		},
 		Configuration: ConfigStatus{
-			Workers:      hs.service.cfg.Dispatcher.Workers,
 			BatchSize:    hs.service.cfg.Dispatcher.BatchSize,
 			PollInterval: hs.service.cfg.Dispatcher.PollInterval.String(),
 			MaxAttempts:  hs.service.cfg.Dispatcher.MaxAttempts,
@@ -264,7 +263,6 @@ type ReadinessStatus struct {
 }
 
 type ConfigStatus struct {
-	Workers      int    `json:"workers"`
 	BatchSize    int    `json:"batch_size"`
 	PollInterval string `json:"poll_interval"`
 	MaxAttempts  int    `json:"max_attempts"`

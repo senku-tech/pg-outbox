@@ -294,12 +294,12 @@ func (h *HybridProcessor) waitForNotification(ctx context.Context) {
 	}
 	
 	if notification != nil {
-		h.logger.Debug("📨 Received notification", 
+		h.logger.Info("📨 Received notification",
 			zap.String("channel", notification.Channel),
 			zap.String("payload", notification.Payload))
-		
-		// Process events immediately
-		h.processEvents(ctx)
+
+		// Process immediately - don't wait for next poll cycle
+		h.processEventsWithModeCheck(ctx)
 	}
 }
 
@@ -333,29 +333,47 @@ func (h *HybridProcessor) fallbackCheck(ctx context.Context) {
 func (h *HybridProcessor) processBatch(ctx context.Context) error {
 	startTime := time.Now()
 
-	// Claim events
+	h.logger.Info("🔍 processBatch: Attempting to claim events", zap.Int("batch_size", h.cfg.BatchSize))
+
+	// Start transaction for atomic batch processing
+	tx, err := h.pool.Begin(ctx)
+	if err != nil {
+		h.metrics.RecordError()
+		h.logger.Error("❌ processBatch: Failed to begin transaction", zap.Error(err))
+		return fmt.Errorf("failed to begin transaction: %w", err)
+	}
+	defer tx.Rollback(ctx)
+
+	// Claim events using CTE pattern (increment attempts, don't set published_at yet)
 	query := `
-		UPDATE outboxes
-		SET published_at = NOW()
-		WHERE id IN (
+		WITH claimed AS (
 			SELECT id FROM outboxes
 			WHERE published_at IS NULL
+			  AND attempts < $2
 			ORDER BY seq
 			LIMIT $1
 			FOR UPDATE SKIP LOCKED
 		)
-		RETURNING id, topic, metadata, payload
+		UPDATE outboxes o
+		SET attempts = o.attempts + 1
+		FROM claimed c
+		WHERE o.id = c.id
+		RETURNING o.id, o.topic, o.metadata, o.payload
 	`
 
-	rows, err := h.pool.Query(ctx, query, h.cfg.BatchSize)
+	rows, err := tx.Query(ctx, query, h.cfg.BatchSize, h.cfg.MaxAttempts)
 	if err != nil {
 		h.metrics.RecordError()
+		h.logger.Error("❌ processBatch: Failed to execute claim query", zap.Error(err))
 		return fmt.Errorf("failed to claim events: %w", err)
 	}
 	defer rows.Close()
 
 	// Process claimed events
 	var eventCount int
+	var publishedIDs []string
+
+	h.logger.Info("🔍 processBatch: Query executed, scanning rows")
 	for rows.Next() {
 		var id string
 		var event outbox.OutboxEvent
@@ -375,11 +393,16 @@ func (h *HybridProcessor) processBatch(ctx context.Context) error {
 		// Publish to NATS
 		if err := h.publisher.Publish(ctx, event, systemMetadata); err != nil {
 			h.metrics.RecordError()
-			// Mark event as failed
-			h.markFailed(ctx, id, err)
+			h.logger.Error("Failed to publish event to NATS",
+				zap.String("event_id", id),
+				zap.String("topic", event.Topic),
+				zap.Error(err))
+			// Don't mark as failed in transaction, just continue
+			// Transaction will rollback and attempts will stay incremented
 			continue
 		}
 
+		publishedIDs = append(publishedIDs, id)
 		eventCount++
 		h.metrics.RecordSuccess(time.Since(startTime))
 	}
@@ -389,10 +412,31 @@ func (h *HybridProcessor) processBatch(ctx context.Context) error {
 		return fmt.Errorf("error iterating events: %w", err)
 	}
 
+	h.logger.Info("🔍 processBatch: Finished scanning rows", zap.Int("event_count", eventCount))
+
+	// Mark all successfully published events
+	if len(publishedIDs) > 0 {
+		markQuery := `UPDATE outboxes SET published_at = NOW() WHERE id = ANY($1)`
+		if _, err := tx.Exec(ctx, markQuery, publishedIDs); err != nil {
+			h.logger.Error("Failed to mark events as published",
+				zap.Int("count", len(publishedIDs)),
+				zap.Error(err))
+			// Continue anyway, events were published to NATS
+		}
+	}
+
+	// Commit the transaction
+	if err := tx.Commit(ctx); err != nil {
+		h.logger.Error("Failed to commit transaction", zap.Error(err))
+		return fmt.Errorf("failed to commit transaction: %w", err)
+	}
+
 	if eventCount > 0 {
-		h.logger.Debug("Batch processed",
+		h.logger.Info("✅ Batch processed",
 			zap.Int("events", eventCount),
 			zap.Duration("duration", time.Since(startTime)))
+	} else {
+		h.logger.Info("ℹ️  processBatch: No events claimed (queue empty or events locked)")
 	}
 
 	return nil

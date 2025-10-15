@@ -2,9 +2,8 @@ dispatcher:
   instance_id: "dispatcher-1"  # Unique identifier for this instance
   batch_size: 100              # Number of events to process per batch
   max_attempts: 3              # Maximum retry attempts before giving up
-  poll_interval: 1s            # How often to poll for new events
-  fallback_interval: 30s       # Fallback polling interval
-  workers: 5                   # Number of concurrent batch processors
+  poll_interval: 1s            # How often to poll for new events (POLLING mode)
+  fallback_interval: 30s       # Fallback polling interval (LISTEN mode safety check)
   shutdown_grace: 30s          # Grace period for shutdown
 
 database:
