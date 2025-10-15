@@ -2,6 +2,10 @@
 
 A reliable PostgreSQL-based transactional outbox pattern implementation for publishing events to NATS/JetStream.
 
+**Dual-mode solution:**
+1. **Library/SDK** - Import into your Go application to write events to the outbox table
+2. **Standalone Dispatcher** - Run as an independent service to publish events from the outbox to NATS
+
 ## Features
 
 - **Transactional Outbox Pattern**: Ensures events are published at-least-once with no data loss
@@ -17,82 +21,260 @@ A reliable PostgreSQL-based transactional outbox pattern implementation for publ
 ## Architecture
 
 ```
-┌─────────────┐
-│ Application │
-│   Service   │──┐
-└─────────────┘  │
-                 │ 1. Insert event in transaction
-                 ▼
-         ┌───────────────┐
-         │   Outbox      │
-         │   Table       │
-         │ (PostgreSQL)  │
-         └───────────────┘
-                 │
-                 │ 2. Dispatcher claims batch
-                 ▼
-         ┌───────────────┐
-         │  pg-outbox    │
-         │  Dispatcher   │
-         └───────────────┘
-                 │
-                 │ 3. Publish events
-                 ▼
-         ┌───────────────┐
-         │     NATS      │
-         │  JetStream    │
-         └───────────────┘
+┌─────────────────────┐
+│  Your Application   │
+│  (uses pg-outbox    │──┐  1. Insert event in transaction
+│   library/SDK)      │  │     (same transaction as business logic)
+└─────────────────────┘  │
+                         ▼
+                 ┌───────────────┐
+                 │   Outbox      │
+                 │   Table       │
+                 │ (PostgreSQL)  │
+                 └───────────────┘
+                         │
+                         │  2. pg-outbox dispatcher claims batch
+                         │     (FOR UPDATE SKIP LOCKED)
+                         ▼
+                 ┌───────────────┐
+                 │  pg-outbox    │
+                 │  Dispatcher   │
+                 │  (standalone) │
+                 └───────────────┘
+                         │
+                         │  3. Publish events to NATS
+                         ▼
+                 ┌───────────────┐
+                 │     NATS      │
+                 │  JetStream    │
+                 └───────────────┘
 ```
 
 ## Installation
+
+### As a Library/SDK
 
 ```bash
 go get github.com/senku-tech/pg-outbox
 ```
 
-## Database Setup
+### As a Standalone Tool
 
-### 1. Run the schema migration
-
-```sql
--- See sql/schema.sql for the complete schema
--- This creates the partitioned outboxes table with indexes
+#### From Source
+```bash
+git clone https://github.com/senku-tech/pg-outbox.git
+cd pg-outbox
+make build
+# Binary will be in bin/pg-outbox-dispatcher
 ```
 
-### 2. Insert events from your application
+#### Using Docker
+```bash
+docker pull ghcr.io/senku-tech/pg-outbox-dispatcher:latest
+```
+
+#### Using Go Install
+```bash
+go install github.com/senku-tech/pg-outbox/cmd/dispatcher@latest
+```
+
+## Quick Start
+
+### 1. Database Setup
+
+Run the schema migration to create the outbox table:
+
+```bash
+psql your_database < sql/schema.sql
+```
+
+This creates:
+- Partitioned `outboxes` table with monthly partitions
+- Indexes for efficient querying
+- Automatic partition creation function
+- Optional cleanup function
+
+### 2. Use the Library in Your Application
 
 ```go
-// In your application code, insert events in the same transaction as your business logic
-tx, err := db.Begin()
-defer tx.Rollback()
+package main
 
-// Your business logic
-user := createUser(tx, userData)
+import (
+    "context"
 
-// Insert outbox event in the same transaction
-_, err = tx.Exec(`
-    INSERT INTO outboxes (topic, metadata, payload)
-    VALUES ($1, $2, $3)
-`, "user.created", metadata, payload)
+    "github.com/jackc/pgx/v5/pgxpool"
+    "github.com/senku-tech/pg-outbox/pkg/outbox"
+)
 
-tx.Commit()
+func main() {
+    // Connect to your database
+    pool, _ := pgxpool.New(context.Background(), "postgresql://...")
+    defer pool.Close()
+
+    // Create outbox writer
+    writer := outbox.NewWriter(pool)
+
+    // Start a transaction for your business logic
+    tx, _ := pool.Begin(context.Background())
+    defer tx.Rollback(context.Background())
+
+    // Your business logic
+    user := createUser(tx, userData)
+
+    // Publish event to outbox in the SAME transaction
+    err := writer.WithTx(tx).Publish(context.Background(), outbox.Event{
+        Topic: "user.created",
+        Metadata: map[string]interface{}{
+            "event-id":       "550e8400-e29b-41d4-a716-446655440000",
+            "correlation-id": "request-123",
+        },
+        Payload: map[string]interface{}{
+            "user_id": user.ID,
+            "email":   user.Email,
+            "name":    user.Name,
+        },
+    })
+
+    if err != nil {
+        // Handle error
+        return
+    }
+
+    // Commit transaction (both user creation and outbox event)
+    tx.Commit(context.Background())
+}
 ```
 
-## Dispatcher Setup
+### 3. Run the Dispatcher
 
-### Configuration
+The dispatcher reads events from the outbox table and publishes them to NATS.
+
+#### Using Binary
+
+```bash
+# Create a config file (see examples/config.example.yaml)
+./bin/pg-outbox-dispatcher -config config.yaml
+```
+
+#### Using Docker
+
+```bash
+docker run -d \
+  -e DATABASE_DSN="postgresql://user:pass@host:5432/db" \
+  -e NATS_URL="nats://nats:4222" \
+  -p 8080:8080 \
+  ghcr.io/senku-tech/pg-outbox-dispatcher:latest
+```
+
+#### Using Docker Compose
+
+```yaml
+version: '3.8'
+
+services:
+  pg-outbox-dispatcher:
+    image: ghcr.io/senku-tech/pg-outbox-dispatcher:latest
+    environment:
+      DATABASE_DSN: "postgresql://user:pass@postgres:5432/mydb"
+      NATS_URL: "nats://nats:4222"
+      LOG_LEVEL: "info"
+    ports:
+      - "8080:8080"
+    depends_on:
+      - postgres
+      - nats
+    restart: unless-stopped
+```
+
+## Library Usage
+
+### Simple Event Publishing
+
+```go
+import "github.com/senku-tech/pg-outbox/pkg/outbox"
+
+// Create writer
+writer := outbox.NewWriter(db)
+
+// Publish single event
+err := writer.Publish(ctx, outbox.Event{
+    Topic: "order.created",
+    Payload: orderData,
+})
+```
+
+### With Transaction (Recommended)
+
+```go
+// Start transaction
+tx, _ := pool.Begin(ctx)
+defer tx.Rollback(ctx)
+
+// Your business logic
+order := createOrder(tx, orderData)
+inventory := updateInventory(tx, order.Items)
+
+// Create writer with transaction
+txWriter := writer.WithTx(tx)
+
+// Publish events in same transaction
+txWriter.Publish(ctx, outbox.Event{
+    Topic: "order.created",
+    Payload: order,
+})
+
+txWriter.Publish(ctx, outbox.Event{
+    Topic: "inventory.updated",
+    Payload: inventory,
+})
+
+// Commit (all-or-nothing)
+tx.Commit(ctx)
+```
+
+### Batch Publishing
+
+```go
+events := []outbox.Event{
+    {Topic: "user.created", Payload: user1},
+    {Topic: "user.created", Payload: user2},
+    {Topic: "user.created", Payload: user3},
+}
+
+// Publish all events in one database operation
+writer.PublishBatch(ctx, events)
+```
+
+### Helper Functions
+
+```go
+// Simple event (topic + payload)
+event := outbox.NewEvent("user.updated", userData)
+
+// With metadata
+event := outbox.NewEventWithMetadata(
+    "order.placed",
+    map[string]interface{}{
+        "event-id": uuid.New().String(),
+        "user-id": "user-123",
+    },
+    orderData,
+)
+```
+
+## Dispatcher Configuration
 
 Create a `config.yaml`:
 
 ```yaml
 dispatcher:
-  instance_id: "dispatcher-1"
-  batch_size: 100
-  max_attempts: 3
-  poll_interval: 1s
-  fallback_interval: 30s
-  workers: 5
-  shutdown_grace: 30s
+  instance_id: "dispatcher-1"  # Unique ID for this instance
+  batch_size: 100              # Events per batch
+  max_attempts: 3              # Max retries before giving up
+  poll_interval: 1s            # Polling frequency
+  fallback_interval: 30s       # Fallback polling interval
+  workers: 5                   # Concurrent batch processors
+  shutdown_grace: 30s          # Graceful shutdown timeout
 
 database:
   dsn: "postgresql://user:pass@localhost:5432/mydb"
@@ -106,13 +288,14 @@ nats:
   jetstream:
     enabled: true
     stream_name: "EVENTS"
+  # Optional: Transform topics before publishing
   topic_map:
-    "user.created": "app.users.created"
-    "order.placed": "app.orders.placed"
+    "user.created": "production.users.created"
+    "order.placed": "production.orders.placed"
 
 logging:
-  level: "info"
-  format: "json"
+  level: "info"   # debug, info, warn, error
+  format: "json"  # json, console
 
 metrics:
   enabled: true
@@ -120,105 +303,14 @@ metrics:
   path: "/metrics"
 ```
 
-### Running the Dispatcher
-
-```go
-package main
-
-import (
-    "context"
-    "github.com/senku-tech/pg-outbox/pkg/config"
-    "github.com/senku-tech/pg-outbox/pkg/dispatcher"
-    "go.uber.org/zap"
-)
-
-func main() {
-    logger, _ := zap.NewProduction()
-
-    cfg, err := config.LoadConfig("config.yaml")
-    if err != nil {
-        logger.Fatal("Failed to load config", zap.Error(err))
-    }
-
-    service, err := dispatcher.NewService(cfg, logger)
-    if err != nil {
-        logger.Fatal("Failed to create service", zap.Error(err))
-    }
-
-    ctx := context.Background()
-    if err := service.Start(ctx); err != nil {
-        logger.Fatal("Failed to start service", zap.Error(err))
-    }
-
-    // Wait for shutdown signal...
-}
-```
-
-## Environment Variables
+### Environment Variables
 
 Override configuration with environment variables:
 
-- `DATABASE_DSN`: PostgreSQL connection string
-- `NATS_URL`: NATS server URL
-- `DISPATCHER_INSTANCE_ID`: Unique instance identifier
-- `LOG_LEVEL`: Logging level (debug, info, warn, error)
-
-## Event Structure
-
-### Outbox Table Schema
-
-```sql
-CREATE TABLE outboxes (
-    id UUID PRIMARY KEY,
-    seq BIGSERIAL NOT NULL,
-    created_at TIMESTAMPTZ NOT NULL,
-    topic VARCHAR(255) NOT NULL,
-    metadata JSONB,              -- Event headers/metadata
-    payload JSONB NOT NULL,      -- Event data
-    published_at TIMESTAMPTZ,    -- NULL = not published
-    attempts INTEGER DEFAULT 0,
-    last_error TEXT
-) PARTITION BY RANGE (created_at);
-```
-
-### Metadata Format
-
-The `metadata` field can contain:
-
-```json
-{
-  "event-id": "550e8400-e29b-41d4-a716-446655440000",
-  "correlation-id": "request-123",
-  "user-id": "user-456",
-  "source": "user-service"
-}
-```
-
-Metadata fields are automatically added as NATS message headers.
-
-### Payload Format
-
-The `payload` field contains your event data:
-
-```json
-{
-  "user_id": "123",
-  "email": "user@example.com",
-  "name": "John Doe",
-  "created_at": "2024-01-01T00:00:00Z"
-}
-```
-
-## Topic Mapping
-
-Transform topics before publishing to NATS:
-
-```yaml
-nats:
-  topic_map:
-    "user.created": "production.users.created"
-    "order.*": "production.orders.*"
-```
+- `DATABASE_DSN` - PostgreSQL connection string
+- `NATS_URL` - NATS server URL
+- `DISPATCHER_INSTANCE_ID` - Unique instance identifier
+- `LOG_LEVEL` - Logging level
 
 ## Monitoring
 
@@ -227,87 +319,128 @@ nats:
 - `GET /health` - Overall health status
 - `GET /ready` - Readiness check
 
+```bash
+curl http://localhost:8080/health
+curl http://localhost:8080/ready
+```
+
 ### Metrics
 
-- `GET /metrics` - Prometheus metrics
+Prometheus metrics available at `GET /metrics`:
 
-Key metrics:
 - `outbox_events_published_total` - Total events published
 - `outbox_events_failed_total` - Total failed events
 - `outbox_batch_processing_duration_seconds` - Batch processing time
 - `outbox_pending_events` - Current pending event count
 
+## Scaling
+
+### Horizontal Scaling
+
+Run multiple dispatcher instances - PostgreSQL's `FOR UPDATE SKIP LOCKED` ensures no duplicate processing:
+
+```yaml
+# Kubernetes deployment with 3 replicas
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: pg-outbox-dispatcher
+spec:
+  replicas: 3  # Multiple instances process in parallel
+  selector:
+    matchLabels:
+      app: pg-outbox-dispatcher
+  template:
+    # ... container spec
+```
+
+Each instance claims different batches automatically - no coordination needed!
+
+### Vertical Scaling
+
+Increase `workers` in configuration for parallel batch processing within a single instance.
+
 ## Best Practices
 
-### 1. Always use transactions
+### 1. Always Use Transactions
 
 ```go
-tx, _ := db.Begin()
-defer tx.Rollback()
+tx, _ := pool.Begin(ctx)
+defer tx.Rollback(ctx)
 
 // Business logic
 createOrder(tx, order)
 
 // Outbox event in same transaction
-insertOutboxEvent(tx, "order.created", orderData)
+writer.WithTx(tx).Publish(ctx, event)
 
-tx.Commit()
+// Commit atomically
+tx.Commit(ctx)
 ```
 
-### 2. Include correlation IDs
+### 2. Include Correlation IDs
 
-```json
-{
-  "metadata": {
-    "correlation-id": "request-abc-123",
-    "causation-id": "event-xyz-456"
-  }
+```go
+event := outbox.NewEventWithMetadata(
+    "order.created",
+    map[string]interface{}{
+        "correlation-id": requestID,
+        "causation-id":   parentEventID,
+        "user-id":        userID,
+    },
+    orderData,
+)
+```
+
+### 3. Make Consumers Idempotent
+
+Events are published **at-least-once**. Design consumers to handle duplicates:
+
+```go
+// In your consumer
+if eventAlreadyProcessed(eventID) {
+    return // Skip duplicate
 }
+processEvent(event)
+markAsProcessed(eventID)
 ```
 
-### 3. Monitor stuck events
+### 4. Monitor Stuck Events
 
 ```sql
+-- Find events that might be stuck
 SELECT * FROM outboxes
 WHERE published_at IS NULL
   AND attempts > 0
   AND created_at < NOW() - INTERVAL '5 minutes';
 ```
 
-### 4. Clean up old events
+### 5. Clean Up Old Events
 
 ```sql
--- Delete events older than 30 days
+-- Delete published events older than 30 days
 SELECT cleanup_old_outbox_events(30);
 ```
 
-### 5. Partition maintenance
+## Database Schema
 
-Create partitions ahead of time:
+The outbox table structure:
 
 ```sql
--- Create next month's partition
-SELECT create_monthly_partition('outboxes', '2024-02-01');
+CREATE TABLE outboxes (
+    id UUID PRIMARY KEY,
+    seq BIGSERIAL NOT NULL,              -- FIFO ordering
+    created_at TIMESTAMPTZ NOT NULL,
+    topic VARCHAR(255) NOT NULL,         -- NATS topic
+    metadata JSONB,                      -- Event headers
+    payload JSONB NOT NULL,              -- Event data
+    published_at TIMESTAMPTZ,            -- NULL = not published
+    attempts INTEGER DEFAULT 0,          -- Retry count
+    last_error TEXT                      -- Error message if failed
+) PARTITION BY RANGE (created_at);       -- Monthly partitions
 ```
 
-## Deployment
-
-### Docker
-
-```dockerfile
-FROM golang:1.23-alpine AS builder
-WORKDIR /app
-COPY go.mod go.sum ./
-RUN go mod download
-COPY . .
-RUN go build -o dispatcher ./cmd/dispatcher
-
-FROM alpine:latest
-RUN apk --no-cache add ca-certificates
-COPY --from=builder /app/dispatcher /dispatcher
-COPY config.yaml /config.yaml
-CMD ["/dispatcher", "-config", "/config.yaml"]
-```
+## Deployment Examples
 
 ### Kubernetes
 
@@ -315,20 +448,20 @@ CMD ["/dispatcher", "-config", "/config.yaml"]
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: outbox-dispatcher
+  name: pg-outbox-dispatcher
 spec:
-  replicas: 3  # Multiple instances for high availability
+  replicas: 3
   selector:
     matchLabels:
-      app: outbox-dispatcher
+      app: pg-outbox-dispatcher
   template:
     metadata:
       labels:
-        app: outbox-dispatcher
+        app: pg-outbox-dispatcher
     spec:
       containers:
       - name: dispatcher
-        image: your-registry/outbox-dispatcher:latest
+        image: ghcr.io/senku-tech/pg-outbox-dispatcher:latest
         env:
         - name: DATABASE_DSN
           valueFrom:
@@ -344,49 +477,99 @@ spec:
           httpGet:
             path: /health
             port: 8080
+          initialDelaySeconds: 10
+          periodSeconds: 30
         readinessProbe:
           httpGet:
             path: /ready
             port: 8080
+          initialDelaySeconds: 5
+          periodSeconds: 10
 ```
 
-## Scaling
+### Systemd Service
 
-- **Horizontal Scaling**: Run multiple dispatcher instances - `FOR UPDATE SKIP LOCKED` ensures no duplicate processing
-- **Vertical Scaling**: Increase `workers` in configuration for parallel batch processing
-- **Partition Pruning**: Old partitions can be dropped for efficient storage
+```ini
+[Unit]
+Description=pg-outbox Dispatcher
+After=network.target postgresql.service
+
+[Service]
+Type=simple
+User=outbox
+Environment=DATABASE_DSN=postgresql://...
+Environment=NATS_URL=nats://localhost:4222
+ExecStart=/usr/local/bin/pg-outbox-dispatcher -config /etc/pg-outbox/config.yaml
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+```
 
 ## Troubleshooting
 
 ### Events not being published
 
-1. Check dispatcher logs for errors
+1. Check dispatcher logs: `docker logs pg-outbox-dispatcher`
 2. Verify NATS connection: `curl http://localhost:8080/health`
-3. Check for stuck events: See monitoring SQL above
+3. Check for stuck events (see SQL above)
+4. Verify dispatcher is running: `curl http://localhost:8080/ready`
 
 ### High latency
 
-1. Increase `workers` in configuration
+1. Increase `workers` for parallel processing
 2. Increase `batch_size` for higher throughput
-3. Check database connection pool settings
+3. Scale horizontally (add more dispatcher instances)
+4. Check database connection pool settings
 
 ### Duplicate events
 
-Events are published **at-least-once**. Consumers should be idempotent or use deduplication:
+This is expected behavior (at-least-once delivery). Make your consumers idempotent:
 
 ```go
-// In your consumer
-if eventAlreadyProcessed(eventID) {
-    return // Skip duplicate
+// Use unique event IDs from metadata
+eventID := msg.Header.Get("Event-ID")
+if alreadyProcessed(eventID) {
+    msg.Ack()
+    return
 }
-processEvent(event)
-markAsProcessed(eventID)
+```
+
+## Development
+
+### Building
+
+```bash
+make build       # Build binary
+make install     # Install to GOPATH/bin
+make docker      # Build Docker image
+```
+
+### Testing
+
+```bash
+make test        # Run tests
+make lint        # Run linter
+make fmt         # Format code
+```
+
+### Running Locally
+
+```bash
+make run         # Run with example config
 ```
 
 ## License
 
-MIT
+MIT - See LICENSE file
 
 ## Contributing
 
 Contributions welcome! Please open an issue or submit a pull request.
+
+## Related Projects
+
+- [NATS](https://nats.io/) - The messaging system
+- [PostgreSQL](https://www.postgresql.org/) - The database
+- [Outbox Pattern](https://microservices.io/patterns/data/transactional-outbox.html) - The pattern
