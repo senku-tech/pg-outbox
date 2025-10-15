@@ -55,10 +55,46 @@ A reliable PostgreSQL-based transactional outbox pattern implementation for publ
 ### As a Library/SDK
 
 ```bash
-go get github.com/senku-tech/pg-outbox
+go get github.com/senku-tech/pg-outbox@latest
 ```
 
 ### As a Standalone Tool
+
+#### Download Pre-built Binary
+
+Download the latest release from [GitHub Releases](https://github.com/senku-tech/pg-outbox/releases):
+
+```bash
+# Linux AMD64
+wget https://github.com/senku-tech/pg-outbox/releases/latest/download/pg-outbox-dispatcher-linux-amd64
+chmod +x pg-outbox-dispatcher-linux-amd64
+mv pg-outbox-dispatcher-linux-amd64 /usr/local/bin/pg-outbox-dispatcher
+
+# Linux ARM64
+wget https://github.com/senku-tech/pg-outbox/releases/latest/download/pg-outbox-dispatcher-linux-arm64
+chmod +x pg-outbox-dispatcher-linux-arm64
+mv pg-outbox-dispatcher-linux-arm64 /usr/local/bin/pg-outbox-dispatcher
+
+# macOS AMD64 (Intel)
+wget https://github.com/senku-tech/pg-outbox/releases/latest/download/pg-outbox-dispatcher-darwin-amd64
+chmod +x pg-outbox-dispatcher-darwin-amd64
+mv pg-outbox-dispatcher-darwin-amd64 /usr/local/bin/pg-outbox-dispatcher
+
+# macOS ARM64 (Apple Silicon)
+wget https://github.com/senku-tech/pg-outbox/releases/latest/download/pg-outbox-dispatcher-darwin-arm64
+chmod +x pg-outbox-dispatcher-darwin-arm64
+mv pg-outbox-dispatcher-darwin-arm64 /usr/local/bin/pg-outbox-dispatcher
+```
+
+#### Using Docker
+```bash
+docker pull ghcr.io/senku-tech/pg-outbox:latest
+```
+
+#### Using Go Install
+```bash
+go install github.com/senku-tech/pg-outbox/cmd/dispatcher@latest
+```
 
 #### From Source
 ```bash
@@ -66,16 +102,6 @@ git clone https://github.com/senku-tech/pg-outbox.git
 cd pg-outbox
 make build
 # Binary will be in bin/pg-outbox-dispatcher
-```
-
-#### Using Docker
-```bash
-docker pull ghcr.io/senku-tech/pg-outbox-dispatcher:latest
-```
-
-#### Using Go Install
-```bash
-go install github.com/senku-tech/pg-outbox/cmd/dispatcher@latest
 ```
 
 ## Quick Start
@@ -163,7 +189,7 @@ docker run -d \
   -e DATABASE_DSN="postgresql://user:pass@host:5432/db" \
   -e NATS_URL="nats://nats:4222" \
   -p 8080:8080 \
-  ghcr.io/senku-tech/pg-outbox-dispatcher:latest
+  ghcr.io/senku-tech/pg-outbox:latest
 ```
 
 #### Using Docker Compose
@@ -173,7 +199,7 @@ version: '3.8'
 
 services:
   pg-outbox-dispatcher:
-    image: ghcr.io/senku-tech/pg-outbox-dispatcher:latest
+    image: ghcr.io/senku-tech/pg-outbox:latest
     environment:
       DATABASE_DSN: "postgresql://user:pass@postgres:5432/mydb"
       NATS_URL: "nats://nats:4222"
@@ -461,7 +487,7 @@ spec:
     spec:
       containers:
       - name: dispatcher
-        image: ghcr.io/senku-tech/pg-outbox-dispatcher:latest
+        image: ghcr.io/senku-tech/pg-outbox:latest
         env:
         - name: DATABASE_DSN
           valueFrom:
