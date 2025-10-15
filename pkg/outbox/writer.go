@@ -11,6 +11,14 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 )
 
+// txCtxKey is the context key for storing pgx.Tx
+type txCtxKey struct{}
+
+// ContextWithTx returns a new context with the transaction stored
+func ContextWithTx(ctx context.Context, tx pgx.Tx) context.Context {
+	return context.WithValue(ctx, txCtxKey{}, tx)
+}
+
 // DBTX is the interface for database operations (pgx.Conn, pgx.Tx, or pgxpool.Pool)
 type DBTX interface {
 	Exec(context.Context, string, ...interface{}) (pgconn.CommandTag, error)
@@ -42,7 +50,6 @@ type Event struct {
 }
 
 // Publish writes one or more publishable entities to the outbox table
-// Optionally pass a pgx.Tx as the last argument to use that transaction
 func (w *Writer) Publish(ctx context.Context, publishables ...Publishable) error {
 	if len(publishables) == 0 {
 		return nil
@@ -61,28 +68,6 @@ func (w *Writer) Publish(ctx context.Context, publishables ...Publishable) error
 	return w.publishBatch(ctx, events)
 }
 
-// PublishTx writes one or more publishable entities using the provided transaction
-func (w *Writer) PublishTx(tx DBTX, ctx context.Context, publishables ...Publishable) error {
-	if len(publishables) == 0 {
-		return nil
-	}
-
-	// Use a temporary writer with the transaction
-	txWriter := &Writer{db: tx}
-
-	// If single entity, use direct publish
-	if len(publishables) == 1 {
-		return txWriter.publish(ctx, publishables[0].ToOutbox())
-	}
-
-	// Multiple entities - convert to events and batch publish
-	events := make([]Event, len(publishables))
-	for i, p := range publishables {
-		events[i] = p.ToOutbox()
-	}
-	return txWriter.publishBatch(ctx, events)
-}
-
 // PublishEvent writes an event directly to the outbox table (for cases where you have raw Event)
 func (w *Writer) PublishEvent(ctx context.Context, event Event) error {
 	return w.publish(ctx, event)
@@ -90,6 +75,9 @@ func (w *Writer) PublishEvent(ctx context.Context, event Event) error {
 
 // publish writes an event to the outbox table (internal method)
 func (w *Writer) publish(ctx context.Context, event Event) error {
+	// Try to get transaction from context, otherwise use writer's db
+	executor := w.getExecutor(ctx)
+
 	// Marshal metadata
 	var metadataJSON []byte
 	var err error
@@ -114,7 +102,7 @@ func (w *Writer) publish(ctx context.Context, event Event) error {
 		VALUES ($1, $2, $3, $4, $5)
 	`
 
-	_, err = w.db.Exec(ctx, query,
+	_, err = executor.Exec(ctx, query,
 		uuid.New(),
 		time.Now(),
 		event.Topic,
@@ -134,6 +122,9 @@ func (w *Writer) publishBatch(ctx context.Context, events []Event) error {
 	if len(events) == 0 {
 		return nil
 	}
+
+	// Try to get transaction from context, otherwise use writer's db
+	executor := w.getExecutor(ctx)
 
 	// Build bulk insert query
 	query := `
@@ -177,12 +168,22 @@ func (w *Writer) publishBatch(ctx context.Context, events []Event) error {
 		)
 	}
 
-	_, err := w.db.Exec(ctx, query, args...)
+	_, err := executor.Exec(ctx, query, args...)
 	if err != nil {
 		return fmt.Errorf("failed to insert batch outbox events: %w", err)
 	}
 
 	return nil
+}
+
+// getExecutor returns the transaction from context if available, otherwise returns the writer's db
+func (w *Writer) getExecutor(ctx context.Context) DBTX {
+	// Try to get transaction from context
+	if tx, ok := ctx.Value(txCtxKey{}).(pgx.Tx); ok {
+		return tx
+	}
+	// Fall back to the writer's db (pool or conn)
+	return w.db
 }
 
 // Helper function to create an event with just topic and payload
