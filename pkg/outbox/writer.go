@@ -28,11 +28,6 @@ func NewWriter(db DBTX) *Writer {
 	return &Writer{db: db}
 }
 
-// WithTx returns a new Writer with the transaction
-func (w *Writer) WithTx(tx pgx.Tx) *Writer {
-	return &Writer{db: tx}
-}
-
 // Publishable is an interface for entities that can be published to the outbox
 // Implement this interface on your domain entities to enable seamless event publishing
 type Publishable interface {
@@ -72,6 +67,9 @@ func (w *Writer) PublishEvent(ctx context.Context, event Event) error {
 
 // publish writes an event to the outbox table (internal method)
 func (w *Writer) publish(ctx context.Context, event Event) error {
+	// Get the executor - either tx from context or the pool
+	executor := w.getExecutor(ctx)
+
 	// Marshal metadata
 	var metadataJSON []byte
 	var err error
@@ -96,7 +94,7 @@ func (w *Writer) publish(ctx context.Context, event Event) error {
 		VALUES ($1, $2, $3, $4, $5)
 	`
 
-	_, err = w.db.Exec(ctx, query,
+	_, err = executor.Exec(ctx, query,
 		uuid.New(),
 		time.Now(),
 		event.Topic,
@@ -116,6 +114,9 @@ func (w *Writer) publishBatch(ctx context.Context, events []Event) error {
 	if len(events) == 0 {
 		return nil
 	}
+
+	// Get the executor - either tx from context or the pool
+	executor := w.getExecutor(ctx)
 
 	// Build bulk insert query
 	query := `
@@ -159,12 +160,22 @@ func (w *Writer) publishBatch(ctx context.Context, events []Event) error {
 		)
 	}
 
-	_, err := w.db.Exec(ctx, query, args...)
+	_, err := executor.Exec(ctx, query, args...)
 	if err != nil {
 		return fmt.Errorf("failed to insert batch outbox events: %w", err)
 	}
 
 	return nil
+}
+
+// getExecutor returns the transaction from context if available, otherwise returns the pool
+func (w *Writer) getExecutor(ctx context.Context) DBTX {
+	// Try to get transaction from context (standard pgx pattern)
+	if tx, ok := ctx.Value(pgx.TxCtxKey{}).(pgx.Tx); ok {
+		return tx
+	}
+	// Fall back to the pool/conn
+	return w.db
 }
 
 // Helper function to create an event with just topic and payload
