@@ -33,6 +33,12 @@ func (w *Writer) WithTx(tx pgx.Tx) *Writer {
 	return &Writer{db: tx}
 }
 
+// Publishable is an interface for entities that can be published to the outbox
+// Implement this interface on your domain entities to enable seamless event publishing
+type Publishable interface {
+	ToOutbox() Event
+}
+
 // Event represents an outbox event to be published
 type Event struct {
 	Topic    string                 // NATS topic/subject
@@ -40,8 +46,32 @@ type Event struct {
 	Payload  interface{}            // Event payload (will be JSON marshaled)
 }
 
-// Publish writes an event to the outbox table
-func (w *Writer) Publish(ctx context.Context, event Event) error {
+// Publish writes one or more publishable entities to the outbox table
+func (w *Writer) Publish(ctx context.Context, publishables ...Publishable) error {
+	if len(publishables) == 0 {
+		return nil
+	}
+
+	// If single entity, use direct publish
+	if len(publishables) == 1 {
+		return w.publish(ctx, publishables[0].ToOutbox())
+	}
+
+	// Multiple entities - convert to events and batch publish
+	events := make([]Event, len(publishables))
+	for i, p := range publishables {
+		events[i] = p.ToOutbox()
+	}
+	return w.publishBatch(ctx, events)
+}
+
+// PublishEvent writes an event directly to the outbox table (for cases where you have raw Event)
+func (w *Writer) PublishEvent(ctx context.Context, event Event) error {
+	return w.publish(ctx, event)
+}
+
+// publish writes an event to the outbox table (internal method)
+func (w *Writer) publish(ctx context.Context, event Event) error {
 	// Marshal metadata
 	var metadataJSON []byte
 	var err error
@@ -81,8 +111,8 @@ func (w *Writer) Publish(ctx context.Context, event Event) error {
 	return nil
 }
 
-// PublishBatch writes multiple events to the outbox table in a single operation
-func (w *Writer) PublishBatch(ctx context.Context, events []Event) error {
+// publishBatch writes multiple events to the outbox table in a single operation (internal method)
+func (w *Writer) publishBatch(ctx context.Context, events []Event) error {
 	if len(events) == 0 {
 		return nil
 	}
