@@ -1,0 +1,35 @@
+dispatcher:
+  instance_id: "dispatcher-1"  # Unique identifier for this instance
+  batch_size: 100              # Number of events to process per batch
+  max_attempts: 3              # Maximum retry attempts before giving up
+  poll_interval: 1s            # How often to poll for new events
+  fallback_interval: 30s       # Fallback polling interval
+  workers: 5                   # Number of concurrent batch processors
+  shutdown_grace: 30s          # Grace period for shutdown
+
+database:
+  dsn: "postgresql://user:password@localhost:5432/mydb?sslmode=disable"
+  max_connections: 20
+  max_idle: 10
+
+nats:
+  url: "nats://localhost:4222"
+  max_retries: 5
+  retry_delay: 2s
+  jetstream:
+    enabled: true
+    stream_name: "EVENTS"
+  # Optional: Topic mapping to transform topics before publishing
+  topic_map:
+    "user.created": "production.users.created"
+    "user.updated": "production.users.updated"
+    "order.placed": "production.orders.placed"
+
+logging:
+  level: "info"   # debug, info, warn, error
+  format: "json"  # json, console
+
+metrics:
+  enabled: true
+  port: 8080
+  path: "/metrics"
