@@ -138,7 +138,7 @@ type MetricsSnapshot struct {
 func (m *Metrics) Reset() {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	
+
 	m.EventsPublished = make(map[string]int64)
 	m.EventsFailed = make(map[string]int64)
 	m.EventsDeadLetter = make(map[string]int64)
@@ -148,4 +148,24 @@ func (m *Metrics) Reset() {
 	m.LastBatchDuration = 0
 	m.LastProcessedCount = 0
 	m.ProcessingTimes = make([]time.Duration, 0, 1000)
+}
+
+// RecordSuccess records a successful event processing
+func (m *Metrics) RecordSuccess(duration time.Duration) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	m.LastBatchDuration = duration
+	if len(m.ProcessingTimes) >= 1000 {
+		m.ProcessingTimes = m.ProcessingTimes[1:]
+	}
+	m.ProcessingTimes = append(m.ProcessingTimes, duration)
+}
+
+// RecordError records an error during processing
+func (m *Metrics) RecordError() {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	m.BatchesFailed++
 }

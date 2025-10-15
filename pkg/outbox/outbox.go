@@ -6,70 +6,59 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
-	"github.com/jackc/pgx/v5/pgconn"
 )
 
-// DBTX is the interface for database operations (pgx.Conn, pgx.Tx, or pgxpool.Pool)
-type DBTX interface {
-	Exec(context.Context, string, ...interface{}) (pgconn.CommandTag, error)
-	Query(context.Context, string, ...interface{}) (pgx.Rows, error)
-	QueryRow(context.Context, string, ...interface{}) pgx.Row
+// OutboxEvent represents an event in the outbox table
+// This is the CONTRACT between write side and read side
+type OutboxEvent struct {
+	Topic    string          `json:"topic"`
+	Metadata json.RawMessage `json:"metadata"`
+	Payload  json.RawMessage `json:"payload"`
 }
 
-// Outbox writes messages to the outbox table
-type Outbox struct {
-	db DBTX
+// Publishable is an interface for entities that can be published to the outbox
+type Publishable interface {
+	ToOutbox() OutboxEvent
 }
+
+// Outbox provides methods to publish events to the outbox table
+type Outbox struct{}
 
 // New creates a new outbox
-func New(db DBTX) *Outbox {
-	return &Outbox{db: db}
+func New() *Outbox {
+	return &Outbox{}
 }
 
-// Write writes a message to the outbox table
-// Pass tx to use a transaction, or nil to use the outbox's db (pool)
-func (o *Outbox) Write(ctx context.Context, tx DBTX, topic string, metadata map[string]interface{}, payload interface{}) error {
-	executor := tx
-	if executor == nil {
-		executor = o.db
+// Publish writes one or more publishable entities to the outbox table
+func (o *Outbox) Publish(ctx context.Context, tx pgx.Tx, publishables ...Publishable) error {
+	if len(publishables) == 0 {
+		return nil
 	}
 
-	// Marshal metadata
-	var metadataJSON []byte
-	var err error
-	if metadata != nil {
-		metadataJSON, err = json.Marshal(metadata)
-		if err != nil {
-			return fmt.Errorf("failed to marshal metadata: %w", err)
+	now := time.Now()
+
+	// Prepare rows for CopyFrom
+	rows := make([][]interface{}, len(publishables))
+	for i, p := range publishables {
+		event := p.ToOutbox()
+		rows[i] = []interface{}{
+			now,
+			event.Topic,
+			event.Metadata,
+			event.Payload,
 		}
-	} else {
-		metadataJSON = []byte("{}")
 	}
 
-	// Marshal payload
-	payloadJSON, err := json.Marshal(payload)
-	if err != nil {
-		return fmt.Errorf("failed to marshal payload: %w", err)
-	}
-
-	// Insert into outbox table
-	query := `
-		INSERT INTO outboxes (id, created_at, topic, metadata, payload)
-		VALUES ($1, $2, $3, $4, $5)
-	`
-
-	_, err = executor.Exec(ctx, query,
-		uuid.New(),
-		time.Now(),
-		topic,
-		metadataJSON,
-		payloadJSON,
+	// Use CopyFrom for bulk insert
+	_, err := tx.CopyFrom(
+		ctx,
+		pgx.Identifier{"outboxes"},
+		[]string{"created_at", "topic", "metadata", "payload"},
+		pgx.CopyFromRows(rows),
 	)
-
 	if err != nil {
-		return fmt.Errorf("failed to insert outbox message: %w", err)
+		return fmt.Errorf("failed to insert outbox events: %w", err)
 	}
 
 	return nil

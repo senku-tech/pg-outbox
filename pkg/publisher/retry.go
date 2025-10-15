@@ -6,6 +6,7 @@ import (
 	"math"
 	"time"
 
+	"github.com/senku-tech/pg-outbox/pkg/outbox"
 	"go.uber.org/zap"
 )
 
@@ -31,7 +32,8 @@ func NewRetryStrategy(maxAttempts int, baseDelay, maxDelay time.Duration, logger
 func (rs *RetryStrategy) PublishWithRetry(
 	ctx context.Context,
 	publisher *EventPublisher,
-	event OutboxEvent,
+	event outbox.OutboxEvent,
+	systemMetadata map[string]string,
 ) error {
 	var lastErr error
 
@@ -44,11 +46,11 @@ func (rs *RetryStrategy) PublishWithRetry(
 		}
 
 		// Attempt to publish
-		err := publisher.Publish(ctx, event)
+		err := publisher.Publish(ctx, event, systemMetadata)
 		if err == nil {
 			if attempt > 1 {
 				rs.logger.Info("Event published after retry",
-					zap.String("event_id", event.ID),
+					zap.String("topic", event.Topic),
 					zap.Int("attempt", attempt))
 			}
 			return nil
@@ -59,7 +61,6 @@ func (rs *RetryStrategy) PublishWithRetry(
 		// Don't retry if we've exceeded max attempts
 		if attempt >= rs.MaxAttempts {
 			rs.logger.Error("Failed to publish event after max attempts",
-				zap.String("event_id", event.ID),
 				zap.String("topic", event.Topic),
 				zap.Int("attempts", attempt),
 				zap.Error(lastErr))
@@ -70,7 +71,6 @@ func (rs *RetryStrategy) PublishWithRetry(
 		delay := rs.calculateBackoff(attempt)
 
 		rs.logger.Warn("Failed to publish event, will retry",
-			zap.String("event_id", event.ID),
 			zap.String("topic", event.Topic),
 			zap.Int("attempt", attempt),
 			zap.Duration("retry_in", delay),

@@ -138,10 +138,10 @@ func (hs *HealthServer) handleMetrics(w http.ResponseWriter, r *http.Request) {
 
 	if dbMetrics != nil && err == nil {
 		response.Database = &DatabaseMetricsResponse{
-			PendingCount:       dbMetrics.PendingCount,
-			FailedCount:        dbMetrics.FailedCount,
-			OldestPendingAge:   dbMetrics.OldestPendingAge.Seconds(),
-			PublishedLastMin:   dbMetrics.PublishedLastMin,
+			PendingCount:     dbMetrics.PendingCount,
+			FailedCount:      0,
+			OldestPendingAge: 0,
+			PublishedLastMin: 0,
 		}
 	}
 
@@ -162,10 +162,7 @@ func (hs *HealthServer) handleStatus(w http.ResponseWriter, r *http.Request) {
 	
 	metrics := hs.service.GetMetrics()
 	dbMetrics, _ := hs.service.GetDatabaseMetrics(r.Context())
-	
-	// Get stuck events for diagnostic
-	stuckEvents, _ := hs.service.processor.GetStuckEvents(r.Context(), 10)
-	
+
 	response := StatusResponse{
 		Instance:  hs.service.cfg.Dispatcher.InstanceID,
 		Timestamp: time.Now().Unix(),
@@ -194,9 +191,9 @@ func (hs *HealthServer) handleStatus(w http.ResponseWriter, r *http.Request) {
 	if dbMetrics != nil {
 		response.Database = &DatabaseStatus{
 			PendingEvents:    dbMetrics.PendingCount,
-			FailedEvents:     dbMetrics.FailedCount,
-			StuckEvents:      len(stuckEvents),
-			OldestPendingAge: dbMetrics.OldestPendingAge.String(),
+			FailedEvents:     0,
+			StuckEvents:      0,
+			OldestPendingAge: "0s",
 		}
 	}
 

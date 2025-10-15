@@ -7,6 +7,8 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/nats-io/nats.go"
+	"github.com/nats-io/nats.go/jetstream"
 	"go.uber.org/zap"
 
 	"github.com/senku-tech/pg-outbox/pkg/config"
@@ -15,17 +17,17 @@ import (
 
 // Service is the main dispatcher service
 type Service struct {
-	pool           *pgxpool.Pool
-	publisher      *publisher.EventPublisher
-	processor      *BatchProcessor
+	pool            *pgxpool.Pool
+	natsConn        *nats.Conn
+	publisher       *publisher.EventPublisher
 	hybridProcessor *HybridProcessor
-	cfg            *config.Config
-	logger         *zap.Logger
-	metrics        *Metrics
+	cfg             *config.Config
+	logger          *zap.Logger
+	metrics         *Metrics
 
-	stopCh     chan struct{}
-	stoppedCh  chan struct{}
-	
+	stopCh    chan struct{}
+	stoppedCh chan struct{}
+
 	// Health tracking
 	mu            sync.RWMutex
 	lastProcessed time.Time
@@ -59,35 +61,43 @@ func NewService(cfg *config.Config, logger *zap.Logger) (*Service, error) {
 		return nil, fmt.Errorf("failed to ping database: %w", err)
 	}
 
-	// Create NATS publisher
-	pub, err := publisher.NewEventPublisher(&cfg.NATS, logger)
+	// Connect to NATS
+	nc, err := nats.Connect(cfg.NATS.URL)
 	if err != nil {
 		pool.Close()
-		return nil, fmt.Errorf("failed to create publisher: %w", err)
+		return nil, fmt.Errorf("failed to connect to NATS: %w", err)
 	}
+
+	// Create JetStream context
+	js, err := jetstream.New(nc)
+	if err != nil {
+		nc.Close()
+		pool.Close()
+		return nil, fmt.Errorf("failed to create JetStream: %w", err)
+	}
+
+	// Create NATS publisher
+	pub := publisher.New(js)
 
 	// Create metrics
 	metrics := NewMetrics()
 
-	// Create batch processor
-	processor := NewBatchProcessor(pool, pub, &cfg.Dispatcher, logger, metrics)
-
 	service := &Service{
-		pool:            pool,
-		publisher:       pub,
-		processor:       processor,
-		cfg:             cfg,
-		logger:          logger,
-		metrics:         metrics,
-		stopCh:          make(chan struct{}),
-		stoppedCh:       make(chan struct{}),
-		isHealthy:       true,
-		isReady:         false,
-		lastProcessed:   time.Now(), // Initialize to now
+		pool:          pool,
+		natsConn:      nc,
+		publisher:     pub,
+		cfg:           cfg,
+		logger:        logger,
+		metrics:       metrics,
+		stopCh:        make(chan struct{}),
+		stoppedCh:     make(chan struct{}),
+		isHealthy:     true,
+		isReady:       false,
+		lastProcessed: time.Now(), // Initialize to now
 	}
 
 	// Create hybrid processor for state-based processing (needs service reference)
-	hybridProcessor := NewHybridProcessor(pool, processor, &cfg.Dispatcher, logger, service)
+	hybridProcessor := NewHybridProcessor(pool, pub, &cfg.Dispatcher, logger, metrics, service)
 	service.hybridProcessor = hybridProcessor
 
 	return service, nil
@@ -132,8 +142,8 @@ func (s *Service) Stop(ctx context.Context) error {
 	}
 
 	// Close resources
-	if err := s.publisher.Close(); err != nil {
-		s.logger.Warn("Failed to close publisher", zap.Error(err))
+	if s.natsConn != nil {
+		s.natsConn.Close()
 	}
 
 	s.pool.Close()
@@ -155,22 +165,22 @@ func (s *Service) Health() error {
 	// Check database connection
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
-	
+
 	if err := s.pool.Ping(ctx); err != nil {
 		return fmt.Errorf("database ping failed: %w", err)
 	}
 
 	// Check NATS connection
-	if err := s.publisher.Health(); err != nil {
-		return fmt.Errorf("NATS health check failed: %w", err)
+	if s.natsConn == nil || !s.natsConn.IsConnected() {
+		return fmt.Errorf("NATS is not connected")
 	}
 
 	// Check if we've processed events recently (if we're supposed to be processing)
 	if s.isReady && time.Since(s.lastProcessed) > 5*time.Minute {
-		// Get metrics to see if there are pending events
-		metrics, err := s.processor.GetMetrics(context.Background())
-		if err == nil && metrics.PendingCount > 0 {
-			return fmt.Errorf("no events processed in last 5 minutes but %d events pending", metrics.PendingCount)
+		// Get pending count to see if there are events to process
+		pendingCount, err := s.hybridProcessor.getPendingCount(context.Background())
+		if err == nil && pendingCount > 0 {
+			return fmt.Errorf("no events processed in last 5 minutes but %d events pending", pendingCount)
 		}
 	}
 
@@ -207,32 +217,19 @@ func (s *Service) GetMetrics() MetricsSnapshot {
 
 // GetDatabaseMetrics returns database-level metrics
 func (s *Service) GetDatabaseMetrics(ctx context.Context) (*DatabaseMetrics, error) {
-	metrics, err := s.processor.GetMetrics(ctx)
+	pendingCount, err := s.hybridProcessor.getPendingCount(ctx)
 	if err != nil {
 		return nil, err
 	}
 
-	var oldestAge time.Duration
-	if metrics.OldestUnpublished != nil {
-		if ts, ok := metrics.OldestUnpublished.(time.Time); ok {
-			oldestAge = time.Since(ts)
-		}
-	}
-
 	return &DatabaseMetrics{
-		PendingCount:      metrics.PendingCount,
-		FailedCount:       metrics.FailedCount,
-		OldestPendingAge:  oldestAge,
-		PublishedLastMin:  metrics.PublishedLastMinute,
+		PendingCount: pendingCount,
 	}, nil
 }
 
 // DatabaseMetrics contains database-level metrics
 type DatabaseMetrics struct {
-	PendingCount     int64
-	FailedCount      int64
-	OldestPendingAge time.Duration
-	PublishedLastMin int64
+	PendingCount int64
 }
 
 // logStartupInfo logs comprehensive service configuration at startup  

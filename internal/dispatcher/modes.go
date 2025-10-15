@@ -10,6 +10,8 @@ import (
 	"go.uber.org/zap"
 
 	"github.com/senku-tech/pg-outbox/pkg/config"
+	"github.com/senku-tech/pg-outbox/pkg/outbox"
+	"github.com/senku-tech/pg-outbox/pkg/publisher"
 )
 
 // ProcessingMode represents the current processing mode
@@ -34,10 +36,11 @@ func (m ProcessingMode) String() string {
 // HybridProcessor handles the state-based hybrid processing
 type HybridProcessor struct {
 	pool      *pgxpool.Pool
-	processor *BatchProcessor
+	publisher *publisher.EventPublisher
 	service   *Service
 	cfg       *config.DispatcherConfig
 	logger    *zap.Logger
+	metrics   *Metrics
 
 	// State management
 	mu           sync.RWMutex
@@ -51,7 +54,7 @@ type HybridProcessor struct {
 }
 
 // NewHybridProcessor creates a new hybrid processor
-func NewHybridProcessor(pool *pgxpool.Pool, processor *BatchProcessor, cfg *config.DispatcherConfig, logger *zap.Logger, service *Service) *HybridProcessor {
+func NewHybridProcessor(pool *pgxpool.Pool, pub *publisher.EventPublisher, cfg *config.DispatcherConfig, logger *zap.Logger, metrics *Metrics, service *Service) *HybridProcessor {
 	// Ensure intervals are positive
 	pollInterval := cfg.PollInterval
 	if pollInterval <= 0 {
@@ -72,10 +75,11 @@ func NewHybridProcessor(pool *pgxpool.Pool, processor *BatchProcessor, cfg *conf
 
 	return &HybridProcessor{
 		pool:           pool,
-		processor:      processor,
+		publisher:      pub,
 		service:        service,
 		cfg:            &safeCfg,
 		logger:         logger,
+		metrics:        metrics,
 		currentMode:    POLLING_MODE, // Always start in polling mode
 		stopCh:         make(chan struct{}),
 	}
@@ -199,7 +203,7 @@ func (h *HybridProcessor) processEvents(ctx context.Context) bool {
 	h.processingWg.Add(1)
 	defer h.processingWg.Done()
 
-	err := h.processor.ProcessBatch(ctx)
+	err := h.processBatch(ctx)
 	if err != nil {
 		h.logger.Error("Failed to process batch", zap.Error(err))
 		return false
@@ -211,14 +215,14 @@ func (h *HybridProcessor) processEvents(ctx context.Context) bool {
 	}
 
 	// Check if there are still pending events to determine if we processed any
-	metrics, err := h.processor.GetMetrics(ctx)
+	pendingCount, err := h.getPendingCount(ctx)
 	if err != nil {
-		h.logger.Error("Failed to get metrics", zap.Error(err))
+		h.logger.Error("Failed to get pending count", zap.Error(err))
 		return false
 	}
 
 	// If there are no pending events, we can switch to LISTEN mode
-	return metrics.PendingCount == 0
+	return pendingCount == 0
 }
 
 // setupListenMode establishes the LISTEN connection
@@ -302,16 +306,16 @@ func (h *HybridProcessor) waitForNotification(ctx context.Context) {
 // fallbackCheck periodically checks for missed events in LISTEN_MODE
 func (h *HybridProcessor) fallbackCheck(ctx context.Context) {
 	h.logger.Debug("🔍 Performing fallback check")
-	
+
 	// Check if there are any pending events we missed
-	metrics, err := h.processor.GetMetrics(ctx)
+	pendingCount, err := h.getPendingCount(ctx)
 	if err != nil {
-		h.logger.Error("Failed to get metrics during fallback check", zap.Error(err))
+		h.logger.Error("Failed to get pending count during fallback check", zap.Error(err))
 		return
 	}
-	
-	if metrics.PendingCount > 0 {
-		h.logger.Warn("📨 Fallback check found missed events", zap.Int64("pending", metrics.PendingCount))
+
+	if pendingCount > 0 {
+		h.logger.Warn("📨 Fallback check found missed events", zap.Int64("pending", pendingCount))
 		// Close LISTEN connection and switch back to polling mode
 		h.mu.Lock()
 		if h.listenConn != nil {
@@ -319,8 +323,109 @@ func (h *HybridProcessor) fallbackCheck(ctx context.Context) {
 			h.listenConn = nil
 		}
 		h.mu.Unlock()
-		
+
 		// Switch back to polling mode to clear the backlog
 		h.setMode(POLLING_MODE)
 	}
+}
+
+// processBatch claims and publishes a batch of events
+func (h *HybridProcessor) processBatch(ctx context.Context) error {
+	startTime := time.Now()
+
+	// Claim events
+	query := `
+		UPDATE outboxes
+		SET published_at = NOW()
+		WHERE id IN (
+			SELECT id FROM outboxes
+			WHERE published_at IS NULL
+			ORDER BY seq
+			LIMIT $1
+			FOR UPDATE SKIP LOCKED
+		)
+		RETURNING id, topic, metadata, payload
+	`
+
+	rows, err := h.pool.Query(ctx, query, h.cfg.BatchSize)
+	if err != nil {
+		h.metrics.RecordError()
+		return fmt.Errorf("failed to claim events: %w", err)
+	}
+	defer rows.Close()
+
+	// Process claimed events
+	var eventCount int
+	for rows.Next() {
+		var id string
+		var event outbox.OutboxEvent
+
+		if err := rows.Scan(&id, &event.Topic, &event.Metadata, &event.Payload); err != nil {
+			h.metrics.RecordError()
+			return fmt.Errorf("failed to scan event: %w", err)
+		}
+
+		// Add system metadata
+		systemMetadata := map[string]string{
+			"Nats-Event-Id":      id,
+			"Nats-Dispatcher-Id": h.cfg.InstanceID,
+			"Nats-Published-At":  time.Now().Format(time.RFC3339),
+		}
+
+		// Publish to NATS
+		if err := h.publisher.Publish(ctx, event, systemMetadata); err != nil {
+			h.metrics.RecordError()
+			// Mark event as failed
+			h.markFailed(ctx, id, err)
+			continue
+		}
+
+		eventCount++
+		h.metrics.RecordSuccess(time.Since(startTime))
+	}
+
+	if err := rows.Err(); err != nil {
+		h.metrics.RecordError()
+		return fmt.Errorf("error iterating events: %w", err)
+	}
+
+	if eventCount > 0 {
+		h.logger.Debug("Batch processed",
+			zap.Int("events", eventCount),
+			zap.Duration("duration", time.Since(startTime)))
+	}
+
+	return nil
+}
+
+// markFailed marks an event as failed
+func (h *HybridProcessor) markFailed(ctx context.Context, id string, publishErr error) {
+	query := `
+		UPDATE outboxes
+		SET attempts = attempts + 1,
+		    last_error = $1,
+		    published_at = NULL
+		WHERE id = $2
+		AND attempts < $3
+	`
+
+	_, err := h.pool.Exec(ctx, query, publishErr.Error(), id, h.cfg.MaxAttempts)
+	if err != nil {
+		h.logger.Error("Failed to mark event as failed",
+			zap.String("event_id", id),
+			zap.Error(err))
+	}
+}
+
+// getPendingCount returns the count of pending events
+func (h *HybridProcessor) getPendingCount(ctx context.Context) (int64, error) {
+	var count int64
+	query := `SELECT COUNT(*) FROM outboxes WHERE published_at IS NULL`
+
+	err := h.pool.QueryRow(ctx, query).Scan(&count)
+	if err != nil {
+		return 0, fmt.Errorf("failed to get pending count: %w", err)
+	}
+
+	return count, nil
 }
