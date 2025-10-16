@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 )
 
@@ -42,7 +43,10 @@ func (o *Outbox) Publish(ctx context.Context, tx pgx.Tx, publishables ...Publish
 	rows := make([][]interface{}, len(publishables))
 	for i, p := range publishables {
 		event := p.ToOutbox()
+		// Generate UUID for each event
+		id := uuid.New()
 		rows[i] = []interface{}{
+			id,
 			now,
 			event.Topic,
 			event.Metadata,
@@ -54,7 +58,7 @@ func (o *Outbox) Publish(ctx context.Context, tx pgx.Tx, publishables ...Publish
 	_, err := tx.CopyFrom(
 		ctx,
 		pgx.Identifier{"outboxes"},
-		[]string{"created_at", "topic", "metadata", "payload"},
+		[]string{"id", "created_at", "topic", "metadata", "payload"},
 		pgx.CopyFromRows(rows),
 	)
 	if err != nil {
